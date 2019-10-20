@@ -38,6 +38,15 @@ SECTIONS {
         *(.rodata .rodata.*)
         *(.data .data.*)
         *(.got)
+    }
+
+    .ap-bootstrap :
+    {
+        . = ALIGN(0x1000);
+        _ap_code_start = .;
+        KEEP(*(.ap-bootstrap))
+        _ap_code_end = .;
+
         . = ALIGN(512);
         _rest_of_bootloader_end_addr = .;
         __bootloader_end = .;

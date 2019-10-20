@@ -27,6 +27,10 @@ impl Write for Printer {
             let index = CURRENT_OFFSET.fetch_add(2, Ordering::Relaxed) as isize;
 
             unsafe {
+                x86_64::instructions::port::PortWrite::write_to_port(0x3f8, byte as u8);
+            }
+            continue;
+            unsafe {
                 VGA_BUFFER.offset(index).write_volatile(byte);
                 VGA_BUFFER.offset(index + 1).write_volatile(0x4f);
             }

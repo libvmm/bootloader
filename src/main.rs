@@ -6,6 +6,7 @@
 #![feature(const_fn)]
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 #[cfg(not(target_os = "none"))]
 compile_error!("The bootloader crate must be compiled for the `x86_64-bootloader.json` target");
@@ -21,8 +22,11 @@ use x86_64::structures::paging::{
     frame::PhysFrameRange, page_table::PageTableEntry, Mapper, Page, PageTable, PageTableFlags,
     PhysFrame, RecursivePageTable, Size2MiB, Size4KiB,
 };
+use x86_64::registers::control::{Cr0, Cr0Flags};
+use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::ux::u9;
 use x86_64::{PhysAddr, VirtAddr};
+use core::fmt::Write;
 
 // The bootloader_config.rs file contains some configuration constants set by the build script:
 // PHYSICAL_MEMORY_OFFSET: The offset into the virtual address space where the physical memory
@@ -37,6 +41,7 @@ global_asm!(include_str!("stage_1.s"));
 global_asm!(include_str!("stage_2.s"));
 global_asm!(include_str!("e820.s"));
 global_asm!(include_str!("stage_3.s"));
+global_asm!(include_str!("ap.s"));
 
 #[cfg(feature = "vga_320x200")]
 global_asm!(include_str!("video_mode/vga_320x200.s"));
@@ -46,6 +51,12 @@ global_asm!(include_str!("video_mode/vga_text_80x25.s"));
 unsafe fn context_switch(boot_info: VirtAddr, entry_point: VirtAddr, stack_pointer: VirtAddr) -> ! {
     asm!("jmp $1; ${:private}.spin.${:uid}: jmp ${:private}.spin.${:uid}" ::
          "{rsp}"(stack_pointer), "r"(entry_point), "{rdi}"(boot_info) :: "intel");
+    ::core::hint::unreachable_unchecked()
+}
+
+unsafe fn context_switch_ap(entry_point: VirtAddr) -> ! {
+    asm!("jmp $0; ${:private}.spin.${:uid}: jmp ${:private}.spin.${:uid}" ::
+         "r"(entry_point) :: "intel");
     ::core::hint::unreachable_unchecked()
 }
 
@@ -82,7 +93,16 @@ extern "C" {
     static __page_table_end: usize;
     static __bootloader_end: usize;
     static __bootloader_start: usize;
+    static _ap_code_start: usize;
     static _p4: usize;
+}
+
+
+#[no_mangle]
+pub unsafe extern "C" fn start_ap() -> ! {
+    let fn_address = unsafe { *((0x7c00 - 0x8) as *const u64) };
+
+    context_switch_ap(VirtAddr::new(fn_address));
 }
 
 #[no_mangle]
@@ -99,6 +119,7 @@ pub unsafe extern "C" fn stage_4() -> ! {
     let page_table_end = &__page_table_end as *const _ as u64;
     let bootloader_start = &__bootloader_start as *const _ as u64;
     let bootloader_end = &__bootloader_end as *const _ as u64;
+    let ap_start = &_ap_code_start as *const _ as u64;
     let p4_physical = &_p4 as *const _ as u64;
 
     load_elf(
@@ -110,6 +131,7 @@ pub unsafe extern "C" fn stage_4() -> ! {
         PhysAddr::new(page_table_end),
         PhysAddr::new(bootloader_start),
         PhysAddr::new(bootloader_end),
+        PhysAddr::new(ap_start),
         PhysAddr::new(p4_physical),
     )
 }
@@ -123,6 +145,7 @@ fn load_elf(
     page_table_end: PhysAddr,
     bootloader_start: PhysAddr,
     bootloader_end: PhysAddr,
+    ap_start: PhysAddr,
     p4_physical: PhysAddr,
 ) -> ! {
     use bootloader::bootinfo::{MemoryRegion, MemoryRegionType};
@@ -237,49 +260,6 @@ fn load_elf(
         rec_page_table.unmap(page).expect("dealloc error").1.flush();
     }
 
-    // Map a page for the boot info structure
-    let boot_info_page = {
-        let page: Page = Page::from_page_table_indices(
-            level4_entries.get_free_entry(),
-            u9::new(0),
-            u9::new(0),
-            u9::new(0),
-        );
-        let frame = frame_allocator
-            .allocate_frame(MemoryRegionType::BootInfo)
-            .expect("frame allocation failed");
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        unsafe {
-            page_table::map_page(
-                page,
-                frame,
-                flags,
-                &mut rec_page_table,
-                &mut frame_allocator,
-            )
-        }
-        .expect("Mapping of bootinfo page failed")
-        .flush();
-        page
-    };
-
-    // If no kernel stack address is provided, map the kernel stack after the boot info page
-    let kernel_stack_address = match KERNEL_STACK_ADDRESS {
-        Some(addr) => Page::containing_address(VirtAddr::new(addr)),
-        None => boot_info_page + 1,
-    };
-
-    // Map kernel segments.
-    let stack_end = page_table::map_kernel(
-        kernel_start.phys(),
-        kernel_stack_address,
-        KERNEL_STACK_SIZE,
-        &segments,
-        &mut rec_page_table,
-        &mut frame_allocator,
-    )
-    .expect("kernel mapping failed");
-
     let physical_memory_offset = if cfg!(feature = "map_physical_memory") {
         let physical_memory_offset = PHYSICAL_MEMORY_OFFSET.unwrap_or_else(|| {
             // If offset not manually provided, find a free p4 entry and map memory here.
@@ -317,9 +297,35 @@ fn load_elf(
         0 // Value is unused by BootInfo::new, so this doesn't matter
     };
 
+    // Map a page for the boot info structure
+    let boot_info_page = {
+        let frame = frame_allocator
+            .allocate_frame(MemoryRegionType::BootInfo)
+            .expect("frame allocation failed");
+        Page::containing_address(VirtAddr::new(frame.start_address().as_u64() + physical_memory_offset))
+    };
+
+    // If no kernel stack address is provided, map the kernel stack after the boot info page
+    let kernel_stack_address = match KERNEL_STACK_ADDRESS {
+        Some(addr) => Page::containing_address(VirtAddr::new(addr)),
+        None => boot_info_page + 1,
+    };
+
+    // Map kernel segments.
+    let stack_end = page_table::map_kernel(
+        kernel_start.phys(),
+        kernel_stack_address,
+        KERNEL_STACK_SIZE,
+        &segments,
+        &mut rec_page_table,
+        &mut frame_allocator,
+    )
+        .expect("kernel mapping failed");
+
     // Construct boot info structure.
     let mut boot_info = BootInfo::new(
         memory_map,
+        ap_start.as_u64() as u32,
         recursive_page_table_addr.as_u64(),
         physical_memory_offset,
     );
@@ -346,24 +352,21 @@ fn load_elf(
 
     let entry_point = VirtAddr::new(entry_point);
 
-    unsafe { context_switch(boot_info_addr, entry_point, stack_end) };
+    unsafe { context_switch(boot_info_addr, entry_point, VirtAddr::new(stack_end.as_u64() + physical_memory_offset)) };
 }
 
 fn enable_nxe_bit() {
-    use x86_64::registers::control::{Efer, EferFlags};
     unsafe { Efer::update(|efer| *efer |= EferFlags::NO_EXECUTE_ENABLE) }
 }
 
 fn enable_write_protect_bit() {
-    use x86_64::registers::control::{Cr0, Cr0Flags};
     unsafe { Cr0::update(|cr0| *cr0 |= Cr0Flags::WRITE_PROTECT) };
 }
 
 #[panic_handler]
 #[no_mangle]
 pub extern "C" fn panic(info: &PanicInfo) -> ! {
-    use core::fmt::Write;
-    write!(printer::Printer, "{}", info).unwrap();
+    writeln!(printer::Printer, "{}", info).unwrap();
     loop {}
 }
 

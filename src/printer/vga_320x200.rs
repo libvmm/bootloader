@@ -34,6 +34,12 @@ impl Printer {
     fn write_char(&mut self, c: char) {
         use font8x8::UnicodeFonts;
 
+        unsafe {
+            x86_64::instructions::port::PortWrite::write_to_port(0x3f8, c as u8);
+        }
+
+        return;
+
         if c == '\n' {
             self.newline();
             return;
